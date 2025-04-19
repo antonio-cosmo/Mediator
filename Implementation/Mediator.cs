@@ -3,6 +3,7 @@ using Microsoft.Extensions.DependencyInjection;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using System.Threading.Tasks;
 
@@ -10,36 +11,43 @@ namespace Mediator.Implementation;
 public class Mediator(IServiceProvider serviceProvider) : IMediator
 {
     private readonly IServiceProvider _provider = serviceProvider;
+    private static readonly Dictionary<Type, MethodInfo> HandlerHandleMethodCache = [];
+    private static readonly Dictionary<Type, Type> HandlerTypeCache = [];
+    private static readonly MethodInfo BehaviorHandleMethod = typeof(IPipelineBehavior<,>).GetMethod("Handle")
+                                       ?? throw new InvalidOperationException($"Handle method not found in behavior type {typeof(IPipelineBehavior<,>)}.");
 
-    public async Task<TResponse> Send<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default)
+    public Task<TResponse> Send<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default)
     {
         var requestType = request.GetType();
-        var handlerType = typeof(IRequestHandler<,>).MakeGenericType(requestType, typeof(TResponse));
+
+        if (!HandlerTypeCache.TryGetValue(requestType, out var handlerType))
+        {
+            handlerType = typeof(IRequestHandler<,>).MakeGenericType(requestType, typeof(TResponse));
+            HandlerTypeCache[requestType] = handlerType;
+        }
 
         var handler = _provider.GetService(handlerType)
             ?? throw new InvalidOperationException($"Handler for request type {requestType} not found.");
 
-        var method = handlerType.GetMethod("Handle")
-            ?? throw new InvalidOperationException($"Handle method not found in handler type {handlerType}.");
-
-        RequestHandlerDelegate<TResponse> handlerDelegate = () =>
+        if (!HandlerHandleMethodCache.TryGetValue(handlerType, out var handleMethod))
         {
-            return (Task<TResponse>)method.Invoke(handler, [request, cancellationToken])!;
-        };
+            handleMethod = handlerType.GetMethod("Handle")
+                ?? throw new InvalidOperationException($"Handle method not found in handler type {handlerType}.");
+            HandlerHandleMethodCache[handlerType] = handleMethod;
+        }
+
+        RequestHandlerDelegate<TResponse> handlerDelegate = () => (Task<TResponse>)handleMethod.Invoke(handler, [request, cancellationToken])!;
 
         var behaviorType = typeof(IPipelineBehavior<,>).MakeGenericType(requestType, typeof(TResponse));
         var behaviors = _provider
             .GetServices(behaviorType)
-            .Reverse()
-            .ToList();
+            .Reverse();
+
         foreach (var behavior in behaviors)
         {
-            var behaviorMethod = behaviorType.GetMethod("Handle")
-                ?? throw new InvalidOperationException($"Handle method not found in behavior type {behaviorType}.");
-
             var next = handlerDelegate;
-            handlerDelegate = () => (Task<TResponse>)behaviorMethod.Invoke(behavior, [request, next, cancellationToken])!;
+            handlerDelegate = () => (Task<TResponse>)BehaviorHandleMethod.Invoke(behavior, [request, next, cancellationToken])!;
         }
-        return await handlerDelegate();
+        return handlerDelegate();
     }
 }
